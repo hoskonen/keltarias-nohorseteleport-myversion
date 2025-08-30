@@ -1,0 +1,4 @@
+<Entity
+        Name="NoHorseTeleport"
+        Script="Scripts/Entities/NoHorseTeleport.lua"
+/>
