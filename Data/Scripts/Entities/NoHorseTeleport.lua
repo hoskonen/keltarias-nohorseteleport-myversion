@@ -16,10 +16,10 @@ NoHorseTeleport                   = NoHorseTeleport or {
 -- ========= Config =========
 NoHorseTeleport.Config            = NoHorseTeleport.Config or {
     -- UI
-    showHorseOnCompass           = true, -- compass marker (unmounted only)
-    showHorseOnMap               = true, -- map POI (unmounted only)
-    debug                        = true, -- set false to quiet logs
-    debugVerbose                 = true,
+    showHorseOnCompass           = true,  -- compass marker (unmounted only)
+    showHorseOnMap               = true,  -- map POI (unmounted only)
+    debug                        = false, -- set false to quiet logs
+    debugVerbose                 = false,
 
     -- Scripted-ride reunite (hardcore-friendly)
     smartReuniteScriptedOnly     = true, -- only after ApseMap session with big displacement & no FT intent
