@@ -16,10 +16,10 @@ NoHorseTeleport                   = NoHorseTeleport or {
 -- ========= Config =========
 NoHorseTeleport.Config            = NoHorseTeleport.Config or {
     -- UI
-    showHorseOnCompass           = true,  -- compass marker (unmounted only)
-    showHorseOnMap               = true,  -- map POI (unmounted only)
-    debug                        = false, -- set false to quiet logs
-    debugVerbose                 = false,
+    showHorseOnCompass           = true, -- compass marker (unmounted only)
+    showHorseOnMap               = true, -- map POI (unmounted only)
+    debug                        = true, -- set false to quiet logs
+    debugVerbose                 = true,
 
     -- Scripted-ride reunite (hardcore-friendly)
     smartReuniteScriptedOnly     = true, -- only after ApseMap session with big displacement & no FT intent
@@ -31,7 +31,14 @@ NoHorseTeleport.Config            = NoHorseTeleport.Config or {
     TELEPORT_COOLDOWN_MS         = 6000,
     POST_CLOSE_DELAY_MS          = 600,
     POST_CLOSE_WATCH_MS          = 10000,
-    POST_CLOSE_WATCH_INTERVAL_MS = 500
+    POST_CLOSE_WATCH_INTERVAL_MS = 500,
+
+    -- Fallback "hard teleport" detector (outside ApseMap)
+    detectHardTeleports          = true,  -- set false if user has manual FT mods
+    HARD_TP_THRESHOLD_METERS     = 300,   -- jump size to flag as teleport
+    HARD_TP_SAMPLING_MS          = 800,   -- how often to sample in OnUpdate
+    HARD_TP_STATIONARY_MS        = 250,   -- confirm Henry stops moving
+    HARD_TP_COOLDOWN_MS          = 12000, -- separate from reunite cooldown
 }
 
 -- ========= Session state =========
@@ -41,8 +48,13 @@ NoHorseTeleport._mapSession       = {
     openedAtMs = 0,
     sawUserFTIntent = false
 }
+
 NoHorseTeleport._preMapPos        = nil
 NoHorseTeleport._lastTeleportTick = 0
+NoHorseTeleport._htLastPos        = nil
+NoHorseTeleport._htLastTickMs     = 0
+NoHorseTeleport._htCooldownTick   = 0
+NoHorseTeleport._lastMapCloseAt   = 0 -- set when map close watch starts
 
 -- ========= Helpers =========
 local function _dbg(tag, msg)
@@ -170,6 +182,64 @@ local function _shouldReunite(cfg, session, prePos, nowPos)
     return true, "ok"
 end
 
+-- Detect sudden displacement outside ApseMap (quests/cutscenes without map)
+function NoHorseTeleport:CheckHardTeleport()
+    local cfg = self.Config
+    if not cfg.detectHardTeleports then return end
+    if not _playerReady() then return end
+    if self._mapSession and self._mapSession.isOpen then return end -- handled by map path
+
+    -- sampling throttle
+    local now = _nowMs()
+    if (now - (self._htLastTickMs or 0)) < (cfg.HARD_TP_SAMPLING_MS or 800) then return end
+    self._htLastTickMs = now
+
+    local pos = _getPos(player)
+    if not pos then return end
+
+    -- first sample
+    if not self._htLastPos then
+        self._htLastPos = pos
+        return
+    end
+
+    local d = _dist2D(pos, self._htLastPos)
+    self._htLastPos = pos
+
+    -- cooldown
+    if (now - (self._htCooldownTick or 0)) < (cfg.HARD_TP_COOLDOWN_MS or 12000) then return end
+
+    -- guard: if a manual FT mod was used right after map interaction, skip for a few seconds
+    -- (we can't see intent here, so just grace-period after any map close)
+    if (now - (self._lastMapCloseAt or 0)) < 4000 then return end
+
+    if d >= (cfg.HARD_TP_THRESHOLD_METERS or 300) then
+        if self.Config.debug then
+            _dbg("Map", string.format("HARD-TP candidate: d=%.1fm (no map session)", d))
+        end
+        -- stationary confirmation
+        Script.SetTimer(cfg.HARD_TP_STATIONARY_MS or 250, function()
+            if not _playerReady() then return end
+            local p1 = _getPos(player)
+            Script.SetTimer(120, function()
+                if not _playerReady() then return end
+                local p2 = _getPos(player)
+                if _dist2D(p1, p2) < 2.0 then
+                    -- Reuse your existing reunite gates (mounted/horse-distance/cooldown inside)
+                    if NoHorseTeleport:_teleportHorse("hard-teleport") then
+                        NoHorseTeleport._htCooldownTick = _nowMs()
+                        if NoHorseTeleport.Config.debug then
+                            _dbg("Reunite", "Hard teleport detected -> horse reunited")
+                        end
+                    end
+                elseif NoHorseTeleport.Config.debug then
+                    _dbg("Reunite", "Hard teleport skipped (player moving)")
+                end
+            end)
+        end)
+    end
+end
+
 -- ========= Lifecycle =========
 function NoHorseTeleport:OnReset() self:Activate(1) end
 
@@ -198,6 +268,7 @@ end
 
 function NoHorseTeleport.Client:OnUpdate()
     NoHorseTeleport:UpdateHorseCompass()
+    NoHorseTeleport:CheckHardTeleport()
 end
 
 -- ========= Map lifecycle handlers =========
@@ -222,6 +293,8 @@ local function _startPostCloseWatch()
     local prePos = NoHorseTeleport._preMapPos
     local started = _nowMs()
     local decided = false
+
+    NoHorseTeleport._lastMapCloseAt = _nowMs()
 
     -- 🔹 single summary line on map close (immediate snapshot)
     if NoHorseTeleport.Config.debug then
