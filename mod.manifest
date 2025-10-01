@@ -4,7 +4,7 @@
     <description>Stops horse teleporting to you and adds map/compass marker for player horse</description>
     <modid>nohorseteleport</modid>
     <author>hoskope keltaria</author>
-    <version>1.2</version>
+    <version>1.4</version>
     <created_on>2025-08-03</created_on>
     <modifies_level>false</modifies_level>
   </info>

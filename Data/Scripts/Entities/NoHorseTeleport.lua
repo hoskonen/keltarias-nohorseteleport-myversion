@@ -1,6 +1,7 @@
 -- NoHorseTeleport.lua
--- Compass/Map horse marker (only when UNMOUNTED) + scripted-ride reunite
--- Lua 5.1 compatible (no 'goto', 5.1-safe)
+-- Compass/Map horse marker (only when UNMOUNTED) + scripted-ride reunite + hard-TP watchdog
+-- Optional: reunite after manual FT started on foot
+-- Lua 5.1 compatible (no 'goto')
 
 NoHorseTeleport                   = NoHorseTeleport or {
     Client = {},
@@ -16,29 +17,33 @@ NoHorseTeleport                   = NoHorseTeleport or {
 -- ========= Config =========
 NoHorseTeleport.Config            = NoHorseTeleport.Config or {
     -- UI
-    showHorseOnCompass           = true,  -- compass marker (unmounted only)
-    showHorseOnMap               = true,  -- map POI (unmounted only)
-    debug                        = false, -- set false to quiet logs
-    debugVerbose                 = false,
+    showHorseOnCompass              = true,  -- compass marker (unmounted only)
+    showHorseOnMap                  = true,  -- map POI (unmounted only)
+    debug                           = false, -- set true for logs
+    debugVerbose                    = false, -- very chatty per-tick logs
 
     -- Scripted-ride reunite (hardcore-friendly)
-    smartReuniteScriptedOnly     = true, -- only after ApseMap session with big displacement & no FT intent
+    smartReuniteScriptedOnly        = false, -- after ApseMap session with big displacement & no FT intent
+
+    -- Manual FT (started on foot): reunite horse after arrival?
+    allowReuniteAfterManualFTOnFoot = true,  -- default keeps hardcore behavior
+    MANUAL_FT_ON_FOOT_WATCH_MS      = 30000, -- window after map close to detect arrival (30s)
 
     -- Thresholds / timing
-    TELEPORT_THRESHOLD_METERS    = 250,
-    HORSE_TOO_FAR_METERS         = 120,
-    STATIONARY_CHECK_DELAY_MS    = 250,
-    TELEPORT_COOLDOWN_MS         = 6000,
-    POST_CLOSE_DELAY_MS          = 600,
-    POST_CLOSE_WATCH_MS          = 10000,
-    POST_CLOSE_WATCH_INTERVAL_MS = 500,
+    TELEPORT_THRESHOLD_METERS       = 250,
+    HORSE_TOO_FAR_METERS            = 120,
+    STATIONARY_CHECK_DELAY_MS       = 250,
+    TELEPORT_COOLDOWN_MS            = 6000,
+    POST_CLOSE_DELAY_MS             = 600,
+    POST_CLOSE_WATCH_MS             = 10000,
+    POST_CLOSE_WATCH_INTERVAL_MS    = 500,
 
     -- Fallback "hard teleport" detector (outside ApseMap)
-    detectHardTeleports          = true,  -- set false if user has manual FT mods
-    HARD_TP_THRESHOLD_METERS     = 300,   -- jump size to flag as teleport
-    HARD_TP_SAMPLING_MS          = 800,   -- how often to sample in OnUpdate
-    HARD_TP_STATIONARY_MS        = 250,   -- confirm Henry stops moving
-    HARD_TP_COOLDOWN_MS          = 12000, -- separate from reunite cooldown
+    detectHardTeleports             = true, -- set false if user has manual FT mods and dislikes this behavior
+    HARD_TP_THRESHOLD_METERS        = 300,  -- jump size to flag as teleport
+    HARD_TP_SAMPLING_MS             = 800,  -- how often to sample in OnUpdate
+    HARD_TP_STATIONARY_MS           = 250,  -- confirm Henry stops moving
+    HARD_TP_COOLDOWN_MS             = 12000 -- separate from reunite cooldown
 }
 
 -- ========= Session state =========
@@ -51,10 +56,17 @@ NoHorseTeleport._mapSession       = {
 
 NoHorseTeleport._preMapPos        = nil
 NoHorseTeleport._lastTeleportTick = 0
+
+-- Hard-TP watchdog
 NoHorseTeleport._htLastPos        = nil
 NoHorseTeleport._htLastTickMs     = 0
 NoHorseTeleport._htCooldownTick   = 0
-NoHorseTeleport._lastMapCloseAt   = 0 -- set when map close watch starts
+
+-- Map-close / FT window tracking
+NoHorseTeleport._lastMapCloseAt   = 0
+NoHorseTeleport._ftIntentAtClose  = false
+NoHorseTeleport._ftWatchUntilMs   = 0
+NoHorseTeleport._ftStartedMounted = false
 
 -- ========= Helpers =========
 local function _dbg(tag, msg)
@@ -182,7 +194,7 @@ local function _shouldReunite(cfg, session, prePos, nowPos)
     return true, "ok"
 end
 
--- Detect sudden displacement outside ApseMap (quests/cutscenes without map)
+-- ========= Hard-TP watchdog (quests/cutscenes; no ApseMap) =========
 function NoHorseTeleport:CheckHardTeleport()
     local cfg = self.Config
     if not cfg.detectHardTeleports then return end
@@ -193,6 +205,17 @@ function NoHorseTeleport:CheckHardTeleport()
     local now = _nowMs()
     if (now - (self._htLastTickMs or 0)) < (cfg.HARD_TP_SAMPLING_MS or 800) then return end
     self._htLastTickMs = now
+
+    -- brief grace after map close, unless we're honoring "manual FT on foot"
+    if (now - (self._lastMapCloseAt or 0)) < 4000 then
+        local within = now <= (self._ftWatchUntilMs or 0)
+        local intent = self._ftIntentAtClose
+        local footOK = self.Config.allowReuniteAfterManualFTOnFoot and within and intent and
+            (self._ftStartedMounted == false)
+        if not footOK then
+            return
+        end
+    end
 
     local pos = _getPos(player)
     if not pos then return end
@@ -206,12 +229,8 @@ function NoHorseTeleport:CheckHardTeleport()
     local d = _dist2D(pos, self._htLastPos)
     self._htLastPos = pos
 
-    -- cooldown
+    -- watchdog cooldown
     if (now - (self._htCooldownTick or 0)) < (cfg.HARD_TP_COOLDOWN_MS or 12000) then return end
-
-    -- guard: if a manual FT mod was used right after map interaction, skip for a few seconds
-    -- (we can't see intent here, so just grace-period after any map close)
-    if (now - (self._lastMapCloseAt or 0)) < 4000 then return end
 
     if d >= (cfg.HARD_TP_THRESHOLD_METERS or 300) then
         if self.Config.debug then
@@ -225,7 +244,6 @@ function NoHorseTeleport:CheckHardTeleport()
                 if not _playerReady() then return end
                 local p2 = _getPos(player)
                 if _dist2D(p1, p2) < 2.0 then
-                    -- Reuse your existing reunite gates (mounted/horse-distance/cooldown inside)
                     if NoHorseTeleport:_teleportHorse("hard-teleport") then
                         NoHorseTeleport._htCooldownTick = _nowMs()
                         if NoHorseTeleport.Config.debug then
@@ -289,28 +307,46 @@ function NoHorseTeleport:OnMapShow(elementName, instanceId, eventName, argTable)
 end
 
 local function _startPostCloseWatch()
-    local cfg = NoHorseTeleport.Config
-    local prePos = NoHorseTeleport._preMapPos
-    local started = _nowMs()
-    local decided = false
+    local cfg                         = NoHorseTeleport.Config
+    local prePos                      = NoHorseTeleport._preMapPos
+    local started                     = _nowMs()
+    local decided                     = false
 
-    NoHorseTeleport._lastMapCloseAt = _nowMs()
+    -- record FT state at close
+    NoHorseTeleport._ftIntentAtClose  = (NoHorseTeleport._mapSession and NoHorseTeleport._mapSession.sawUserFTIntent) or
+        false
+    NoHorseTeleport._ftStartedMounted = _isMounted()
+    NoHorseTeleport._ftWatchUntilMs   = _nowMs() + (cfg.MANUAL_FT_ON_FOOT_WATCH_MS or 30000)
+    NoHorseTeleport._lastMapCloseAt   = _nowMs()
 
-    -- 🔹 single summary line on map close (immediate snapshot)
+    -- single summary line on map close (immediate snapshot)
     if NoHorseTeleport.Config.debug then
         local nowPos       = _getPos(player)
         local displacement = _dist2D(nowPos, prePos)
-        _dbg("Map", string.format(
-            "CLOSE displacement=%.1fm (intent=%s)",
-            displacement,
-            tostring(NoHorseTeleport._mapSession.sawUserFTIntent)
-        ))
+        _dbg("Map",
+            string.format("CLOSE displacement=%.1fm (intent=%s)", displacement,
+                tostring(NoHorseTeleport._mapSession.sawUserFTIntent)))
     end
 
     local function decide(tag)
         if decided then return true end -- already handled
         local nowPos = _getPos(player)
         local ok, why = _shouldReunite(cfg, NoHorseTeleport._mapSession, prePos, nowPos)
+
+        -- Manual FT on foot (optional): if user chose FT while unmounted, allow reunite within the window.
+        if not ok and cfg.allowReuniteAfterManualFTOnFoot then
+            local sessIntent = NoHorseTeleport._mapSession and NoHorseTeleport._mapSession.sawUserFTIntent
+            if sessIntent then
+                local within = _nowMs() <= (NoHorseTeleport._ftWatchUntilMs or 0)
+                if within and (NoHorseTeleport._ftStartedMounted == false) then
+                    ok, why = true, "manual FT on foot"
+                    if NoHorseTeleport.Config.debug then
+                        _dbg("Reunite", "allowing due to manual FT on foot (within window)")
+                    end
+                end
+            end
+        end
+
         if NoHorseTeleport.Config.debugVerbose then
             _dbg("Map", string.format("%s displacement=%.1fm (intent=%s) pre=%s now=%s decision=%s (%s)",
                 tag, _dist2D(nowPos, prePos), tostring(NoHorseTeleport._mapSession.sawUserFTIntent),
@@ -369,7 +405,7 @@ function NoHorseTeleport:OnMapUnload(elementName, instanceId) _startPostCloseWat
 
 function NoHorseTeleport:OnMapDestroyed(elementName, instanceId) _startPostCloseWatch() end
 
--- FT UI intent (filter out manual FT if enabled by other mods)
+-- FT UI intent
 function NoHorseTeleport:OnHighlightFastTravelPoint(_, _, _, args)
     self._mapSession.sawUserFTIntent = true
 end
